@@ -1,96 +1,121 @@
 """
 evaluate_skip_insertion.py
 
-Evaluates the time cost of inserting new nodes into the Skip DAG
-for both the Data DAG and the Event DAG.
+Measures the cost of inserting new elements into the skip DAG with
+InsertIntoSkipDAG (Algorithm 2): ECMH update of the target level, the
+binary-descent path, and the signed path hash stored in the element's
+metadata. Covers both the Data DAG and the Event DAG (Fig. 3).
 
-Results are saved to skip_insertion_eval_detailed_results_{nodes}.csv.
+Each new data artifact derives from 1..edges random existing artifacts, so its
+level is 1 + the highest level of its parents; the matching transformation
+event is inserted into the Event DAG in the same way.
+
+Results are saved to <out>/skip_insertion_eval_detailed_results_{nodes}.csv.
 
 Usage:
-    python evaluate_skip_insertion.py --nodes 25 --genesis 4 --edges 3
-                                      --skip-prob 0.6 --insertions 32
+    python evaluate_skip_insertion.py --nodes 1000 --genesis 50 --edges 10 --insertions 32
 """
 import argparse
-import pandas as pd
 import random
 import time
-from lineage_system_base import (
-    generate_data_dag, extract_event_dag,
-    compute_hashed_level_dag, build_skip_dag,
-    CryptoKeys, HomomorphicHash, DataArtifact, LineageEvent
+from pathlib import Path
+
+import pandas as pd
+
+from secure_lineage_system import (
+    DataArtifact, LineageEvent, Verdict, extract_event_dag, generate_data_dag,
+    link_producing_events,
 )
 
-def insert_into_skip_dag(dag, skip_dag, concat_hashes, crypto, is_data):
-    new_id = f"new_item_{random.randint(100000,999999)}"
-    new_node = DataArtifact(new_id) if is_data else LineageEvent(new_id)
-    dag.graph.add_node(new_id)
-    target_level = max(dag.levels.keys())
-    dag.levels[target_level].add(new_id)
-    new_hash = new_node.compute_full_hash()
-    concat_hashes[target_level] = HomomorphicHash.combine(concat_hashes[target_level], new_hash)
 
-    signed_paths = {}
-    for (u, v) in skip_dag.edges():
-        if u == target_level or v == target_level:
-            path_data = concat_hashes[u] + concat_hashes[v]
-            path_hash = CryptoKeys().sign(path_data)
-            signed_paths[(u, v)] = path_hash
+def new_lineage_step(data, event, edges, i):
+    """Creates a new artifact derived from random parents and its producing event."""
+    data_dag, event_dag = data.dag, event.dag
+    existing = sorted(data_dag.level_map)
+    parents = random.sample(existing, random.randint(1, min(edges, len(existing))))
+    top = max(parents, key=lambda u: (data_dag.level_map[u], u))
+    j_data = data_dag.level_map[top] + 1
 
-    return signed_paths, new_id, target_level
+    aid = f"new_data_{i}"
+    eid = f"new_evt_{top}_{aid}"
+    art = DataArtifact(aid, metadata={"event_ref": eid})
+    evt = LineageEvent(eid, description=f"Transform {top} to {aid}", inputs=[top], outputs=[aid],
+                       metadata={"type": "transform", "source": top, "target": aid})
+    producers = [p for p in event_dag.graph.nodes if aid != p and top in event_dag.events[p].outputs]
+    j_event = 1 + max((event_dag.level_map[p] for p in producers), default=0)
+    return art, j_data, parents, evt, j_event, producers
 
-def evaluate_insertions(nodes, genesis, edges, skip_prob, num_insertions):
-    results = []
 
+def register(dag, x, j, preds, is_data):
+    """Adds the element to the DAG bookkeeping (not part of the timed insertion)."""
+    if is_data:
+        dag.add_data_artifact(x)
+        for p in preds:
+            dag.add_dependency(p, x.id, x.metadata["event_ref"])
+    else:
+        dag.add_event(x)
+        for p in preds:
+            dag.add_causal_dependency(p, x.id)
+    dag.level_map[x.id] = j
+    dag.levels.setdefault(j, set()).add(x.id)
+
+
+def evaluate_insertions(nodes, genesis, edges, num_insertions, buckets):
     data_dag = generate_data_dag(nodes, genesis, edges)
     event_dag = extract_event_dag(data_dag)
-
     data_dag.partition_into_levels()
     event_dag.partition_into_levels()
+    link_producing_events(data_dag, event_dag)
+    data = Verdict(data_dag, k_buckets=buckets).build()
+    event = Verdict(event_dag, k_buckets=buckets).build()
 
-    data_crypto, _, _, data_concat = compute_hashed_level_dag(data_dag, is_data=True)
-    event_crypto, _, _, event_concat = compute_hashed_level_dag(event_dag, is_data=False)
-
-    data_skip, _ = build_skip_dag(max(data_dag.levels), data_concat, data_crypto, skip_prob)
-    event_skip, _ = build_skip_dag(max(event_dag.levels), event_concat, event_crypto, skip_prob)
-
-    for dag, skip, concat, crypto, is_data, name in [
-        (data_dag, data_skip, data_concat, data_crypto, True, "Data"),
-        (event_dag, event_skip, event_concat, event_crypto, False, "Event")]:
-
-        for i in range(num_insertions):
-            start_time = time.perf_counter()
-            signed_paths, new_node_id, target_level = insert_into_skip_dag(dag, skip, concat, crypto, is_data)
-            insertion_time_ms = (time.perf_counter() - start_time) * 1000
-
+    results = []
+    for i in range(num_insertions):
+        art, j_data, parents, evt, j_event, producers = new_lineage_step(data, event, edges, i)
+        for verdict, x, j, preds, name in ((data, art, j_data, parents, "Data"),
+                                           (event, evt, j_event, producers, "Event")):
+            levels_before = verdict.n
+            t = time.perf_counter()
+            verdict.insert(x, j)
+            insertion_time_ms = (time.perf_counter() - t) * 1000
+            register(verdict.dag, x, j, preds, name == "Data")
+            verdict.insert_merkle(x, j)
             results.append({
                 "dag_type": name,
                 "insertion_index": i + 1,
-                "new_node_id": new_node_id,
-                "target_level": target_level,
-                "num_levels": len(dag.levels),
-                "num_nodes": dag.graph.number_of_nodes(),
-                "num_edges": dag.graph.number_of_edges(),
-                "num_skip_edges": skip.number_of_edges(),
-                "insertion_time_ms": round(insertion_time_ms, 6)
+                "new_node_id": x.id,
+                "target_level": j,
+                "new_level_created": j > levels_before,
+                "num_levels": verdict.n,
+                "num_nodes": verdict.dag.graph.number_of_nodes(),
+                "num_edges": verdict.dag.graph.number_of_edges(),
+                "num_skip_edges": verdict.skip.number_of_edges(),
+                "insertion_time_ms": round(insertion_time_ms, 6),
+                "verified_after_insertion": verdict.verify_existence(x),
             })
-
     return pd.DataFrame(results)
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Skip DAG Insertions")
+    parser = argparse.ArgumentParser(description="Evaluate Skip DAG insertions (Algorithm 2)")
     parser.add_argument("--nodes", type=int, default=25)
     parser.add_argument("--genesis", type=int, default=4)
     parser.add_argument("--edges", type=int, default=3)
-    parser.add_argument("--skip-prob", type=float, default=0.6)
     parser.add_argument("--insertions", type=int, default=32)
-
+    parser.add_argument("--buckets", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (default: unseeded)")
+    parser.add_argument("--out", type=str, default=".", help="Output directory for the CSV")
     args = parser.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
 
-    eval_results = evaluate_insertions(
-        args.nodes, args.genesis, args.edges, args.skip_prob, args.insertions)
+    eval_results = evaluate_insertions(args.nodes, args.genesis, args.edges, args.insertions, args.buckets)
 
-    eval_results.to_csv(f"skip_insertion_eval_detailed_results_{str(args.nodes)}.csv", index=False)
-    print(eval_results)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    eval_results.to_csv(out_dir / f"skip_insertion_eval_detailed_results_{args.nodes}.csv", index=False)
+    print(eval_results.groupby("dag_type")[["insertion_time_ms"]].describe())
+
 
 if __name__ == "__main__":
     main()

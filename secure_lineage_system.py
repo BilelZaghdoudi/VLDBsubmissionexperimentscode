@@ -2,26 +2,45 @@
 """
 secure_lineage_system.py
 
-Core implementation of the Secure Lineage System:
-  - Data DAG and Event DAG construction
-  - Level-based partitioning (Algorithm 1)
-  - Homomorphic hashing and RSA-signed level hashes
-  - Skip DAG construction and path verification
-  - Bucket-based Merkle tree construction and membership verification
+Core implementation of VERDICT, following Sections 3-5 of the paper:
+  - Data DAG and Event DAG (Section 2.2)
+  - level partitioning (Section 3.1)
+  - ECMH level hashing over P-256 with signed level hashes and
+    concatenated level hashes CH(L_i) (Sections 3.2-3.3, see ecmh.py)
+  - deterministic binary skip DAG: edges L_i -> L_{i+2^k} (Section 4)
+  - BinaryDescentPath (Algorithm 1), InsertIntoSkipDAG (Algorithm 2),
+    VerifyExistence (Algorithm 3) with one signed path proof per element
+  - hash-based bucket indexing with per-level Merkle trees and signed roots
+    (Section 5.1-5.3)
+  - cross-DAG consistency verification (Section 5.4)
 
-Used by evaluate_secure_lineage.py as the experimental backend.
+Signatures use Ed25519; the paper only requires an EUF-CMA signature scheme.
 """
 import argparse
-import networkx as nx
 import hashlib
 import random
+from collections import defaultdict
 from datetime import datetime
-from typing import List, Dict, Set, Tuple, Any
-from pyvis.network import Network
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.backends import default_backend
+from typing import Dict, List, Optional, Set, Tuple
 
+import networkx as nx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from ecmh import ECMH
+
+# Fields written by VERDICT into an element's metadata live under this key.
+# They are excluded from the element hash, since they are derived from it.
+PROOF_KEY = "verdict"
+
+
+def Hash(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+# ---------------------------------------------------------------------------
+# Elements and DAGs
+# ---------------------------------------------------------------------------
 
 class DataArtifact:
     """Represents a data artifact in the Data DAG."""
@@ -30,15 +49,15 @@ class DataArtifact:
         self.content = content or f"Data artifact {artifact_id}"
         self.metadata = metadata or {}
         self.timestamp = datetime.now().isoformat()
-        self.content_hash = self._compute_hash()
-
-    def _compute_hash(self) -> str:
-        s = f"{self.content}{self.timestamp}"
-        return hashlib.sha256(s.encode()).hexdigest()[:16]
 
     def compute_full_hash(self) -> bytes:
-        data = f"{self.content}||{repr(self.metadata)}".encode()
-        return hashlib.sha256(data).digest()
+        """H(v) = Hash(content || metadata) for the Data DAG."""
+        meta = {k: v for k, v in self.metadata.items() if k != PROOF_KEY}
+        return Hash(f"{self.content}||{repr(sorted(meta.items()))}".encode())
+
+    @property
+    def proof(self) -> Dict:
+        return self.metadata.setdefault(PROOF_KEY, {})
 
 
 class LineageEvent:
@@ -51,19 +70,33 @@ class LineageEvent:
         self.outputs = outputs or []
         self.metadata = metadata or {}
         self.timestamp = datetime.now().isoformat()
-        self.event_hash = self._compute_hash()
-
-    def _compute_hash(self) -> str:
-        s = f"{self.description}{sorted(self.inputs)}{sorted(self.outputs)}{self.timestamp}"
-        return hashlib.sha256(s.encode()).hexdigest()[:16]
 
     def compute_full_hash(self) -> bytes:
-        data = f"{self.description}||{repr(sorted(self.inputs))}||{repr(sorted(self.outputs))}||{repr(self.metadata)}".encode()
-        return hashlib.sha256(data).digest()
+        """H(v) = Hash(description || inputs || outputs || metadata) for the Event DAG."""
+        meta = {k: v for k, v in self.metadata.items() if k != PROOF_KEY}
+        return Hash(f"{self.description}||{repr(sorted(self.inputs))}||"
+                    f"{repr(sorted(self.outputs))}||{repr(sorted(meta.items()))}".encode())
+
+    @property
+    def proof(self) -> Dict:
+        return self.metadata.setdefault(PROOF_KEY, {})
+
+
+def partition_into_levels(graph: nx.DiGraph) -> Tuple[Dict[int, Set[str]], Dict[str, int]]:
+    """Level partitioning (Section 3.1): L(v) = 1 for genesis nodes,
+    otherwise 1 + max level of its predecessors. O(|V| + |E|)."""
+    level_map: Dict[str, int] = {}
+    for v in nx.topological_sort(graph):
+        preds = list(graph.predecessors(v))
+        level_map[v] = 1 + max((level_map[u] for u in preds), default=0)
+    levels: Dict[int, Set[str]] = defaultdict(set)
+    for v, lvl in level_map.items():
+        levels[lvl].add(v)
+    return dict(levels), level_map
 
 
 class DataDAG:
-    """Represents the Data DAG (nodes=DataArtifact)."""
+    """Data DAG: vertices are data artifacts, edges are derivations annotated with events."""
     def __init__(self):
         self.graph = nx.DiGraph()
         self.artifacts: Dict[str, DataArtifact] = {}
@@ -71,9 +104,13 @@ class DataDAG:
         self.levels: Dict[int, Set[str]] = {}
         self.level_map: Dict[str, int] = {}
 
+    @property
+    def elements(self):
+        return self.artifacts
+
     def add_data_artifact(self, artifact: DataArtifact):
         self.artifacts[artifact.id] = artifact
-        self.graph.add_node(artifact.id, content_hash=artifact.content_hash, metadata=artifact.metadata, timestamp=artifact.timestamp)
+        self.graph.add_node(artifact.id)
         if self.graph.in_degree(artifact.id) == 0:
             self.genesis_nodes.add(artifact.id)
 
@@ -81,45 +118,15 @@ class DataDAG:
         if source_id not in self.graph or target_id not in self.graph:
             raise ValueError("Source and target must exist in Data DAG")
         self.graph.add_edge(source_id, target_id, event=event_ref)
-        if target_id in self.genesis_nodes:
-            self.genesis_nodes.remove(target_id)
+        self.genesis_nodes.discard(target_id)
 
-    def partition_into_levels(self) -> Tuple[Dict[int, Set[str]], Dict[str, int]]:
-        """Partition nodes into levels (Algorithm 1)."""
-        self.levels.clear()
-        self.level_map.clear()
-        in_degree = {v: self.graph.in_degree(v) for v in self.graph.nodes()}
-        in_processed = {v: 0 for v in self.graph.nodes()}
-        queue = []
-        level1 = set()
-        for v, deg in in_degree.items():
-            if deg == 0:
-                self.level_map[v] = 1
-                level1.add(v)
-                queue.append(v)
-        self.levels[1] = level1
-        while queue:
-            u = queue.pop(0)
-            u_level = self.level_map[u]
-            for w in self.graph.successors(u):
-                in_processed[w] += 1
-                if w not in self.level_map or self.level_map[w] < u_level + 1:
-                    old = self.level_map.get(w)
-                    new = u_level + 1
-                    if old and w in self.levels.get(old, set()):
-                        self.levels[old].remove(w)
-                    self.level_map[w] = new
-                    if new not in self.levels:
-                        self.levels[new] = set()
-                    self.levels[new].add(w)
-                if in_processed[w] == in_degree[w]:
-                    queue.append(w)
-        self.levels = {lvl: nodes for lvl, nodes in self.levels.items() if nodes}
+    def partition_into_levels(self):
+        self.levels, self.level_map = partition_into_levels(self.graph)
         return self.levels, self.level_map
 
 
 class EventDAG:
-    """Represents the Event DAG (nodes=LineageEvent)."""
+    """Event DAG: vertices are transformation events, edges are causal dependencies."""
     def __init__(self):
         self.graph = nx.DiGraph()
         self.events: Dict[str, LineageEvent] = {}
@@ -127,9 +134,13 @@ class EventDAG:
         self.levels: Dict[int, Set[str]] = {}
         self.level_map: Dict[str, int] = {}
 
+    @property
+    def elements(self):
+        return self.events
+
     def add_event(self, event: LineageEvent):
         self.events[event.id] = event
-        self.graph.add_node(event.id, description=event.description, inputs=event.inputs, outputs=event.outputs, timestamp=event.timestamp)
+        self.graph.add_node(event.id)
         if self.graph.in_degree(event.id) == 0:
             self.genesis_events.add(event.id)
 
@@ -137,388 +148,436 @@ class EventDAG:
         if source_event_id not in self.graph or target_event_id not in self.graph:
             raise ValueError("Source/target event must exist")
         self.graph.add_edge(source_event_id, target_event_id)
-        if target_event_id in self.genesis_events:
-            self.genesis_events.remove(target_event_id)
+        self.genesis_events.discard(target_event_id)
 
-    def partition_into_levels(self) -> Tuple[Dict[int, Set[str]], Dict[str, int]]:
-        """Partition events into levels (Algorithm 1)."""
-        self.levels.clear()
-        self.level_map.clear()
-        in_degree = {v: self.graph.in_degree(v) for v in self.graph.nodes()}
-        in_processed = {v: 0 for v in self.graph.nodes()}
-        queue = []
-        level1 = set()
-        for v, deg in in_degree.items():
-            if deg == 0:
-                self.level_map[v] = 1
-                level1.add(v)
-                queue.append(v)
-        self.levels[1] = level1
-        while queue:
-            u = queue.pop(0)
-            u_level = self.level_map[u]
-            for w in self.graph.successors(u):
-                in_processed[w] += 1
-                if w not in self.level_map or self.level_map[w] < u_level + 1:
-                    old = self.level_map.get(w)
-                    new = u_level + 1
-                    if old and w in self.levels.get(old, set()):
-                        self.levels[old].remove(w)
-                    self.level_map[w] = new
-                    if new not in self.levels:
-                        self.levels[new] = set()
-                    self.levels[new].add(w)
-                if in_processed[w] == in_degree[w]:
-                    queue.append(w)
-        self.levels = {lvl: nodes for lvl, nodes in self.levels.items() if nodes}
+    def partition_into_levels(self):
+        self.levels, self.level_map = partition_into_levels(self.graph)
         return self.levels, self.level_map
 
 
-class HomomorphicHash:
-    """Homomorphic hash: H(x⊕y) = H(x) ⊗ H(y)."""
-    @staticmethod
-    def combine(h1: bytes, h2: bytes) -> bytes:
-        max_len = max(len(h1), len(h2))
-        h1_p = h1 + bytes([0])*(max_len - len(h1))
-        h2_p = h2 + bytes([0])*(max_len - len(h2))
-        comb = bytes(a ^ b for a, b in zip(h1_p, h2_p))
-        return hashlib.sha256(comb).digest()
-
-
-class CryptoKeys:
-    """Manages RSA key pair for signing/verification."""
-    def __init__(self):
-        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
-        self.public_key = self.private_key.public_key()
-
-    def sign(self, data: bytes) -> bytes:
-        return self.private_key.sign(data,
-                                      padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-                                      hashes.SHA256())
-
-    def verify(self, data: bytes, signature: bytes) -> bool:
-        try:
-            self.public_key.verify(signature, data,
-                                   padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-                                   hashes.SHA256())
-            return True
-        except:
-            return False
-
-
 def generate_data_dag(num_nodes: int, num_start_nodes: int, max_edges: int) -> DataDAG:
+    """Synthetic Data DAG: num_start_nodes genesis artifacts; every other artifact
+    derives from 1..max_edges earlier artifacts chosen uniformly at random."""
     if num_start_nodes >= num_nodes:
         raise ValueError("genesis must be less than total nodes")
     data_dag = DataDAG()
-    artifacts = []
     for i in range(num_nodes):
-        art = DataArtifact(artifact_id=f"data_{i}")
-        artifacts.append(art)
-        data_dag.add_data_artifact(art)
+        data_dag.add_data_artifact(DataArtifact(artifact_id=f"data_{i}"))
     genesis_indices = set(random.sample(range(num_nodes), num_start_nodes))
     for i in range(num_nodes):
         aid = f"data_{i}"
-        if i in genesis_indices:
+        if i in genesis_indices or i == 0:
             data_dag.genesis_nodes.add(aid)
             continue
-        possible = list(range(i))
-        if not possible:
-            data_dag.genesis_nodes.add(aid)
-            continue
-        num_edges = random.randint(1, min(max_edges, len(possible)))
-        sources = random.sample(possible, num_edges)
-        for src in sources:
-            s_id = f"data_{src}"
-            event_ref = f"evt_{src}_{i}"
-            data_dag.add_dependency(s_id, aid, event_ref)
+        num_edges = random.randint(1, min(max_edges, i))
+        for src in random.sample(range(i), num_edges):
+            data_dag.add_dependency(f"data_{src}", aid, f"evt_{src}_{i}")
     return data_dag
 
 
 def extract_event_dag(data_dag: DataDAG) -> EventDAG:
+    """Builds the Event DAG from the Data DAG: one transformation event per
+    data edge, one genesis event per genesis artifact, and an edge e1 -> e2
+    whenever an output of e1 is an input of e2. O(|V_E| + |E_E|)."""
     event_dag = EventDAG()
+    producers: Dict[str, List[str]] = defaultdict(list)   # artifact -> events that output it
+    consumers: Dict[str, List[str]] = defaultdict(list)   # artifact -> events that take it as input
+    for g in sorted(data_dag.genesis_nodes):
+        geid = f"genesis_event_{g}"
+        event_dag.add_event(LineageEvent(event_id=geid, description=f"Genesis for {g}",
+                                         inputs=[], outputs=[g],
+                                         metadata={"type": "genesis", "artifact": g}))
+        producers[g].append(geid)
     for src, tgt, edata in data_dag.graph.edges(data=True):
-        event_ref = edata.get('event')
-        if event_ref:
-            event = LineageEvent(event_id=event_ref,
-                                 description=f"Transform {src} to {tgt}",
-                                 inputs=[src], outputs=[tgt],
-                                 metadata={"type": "transform", "source": src, "target": tgt})
-            event_dag.add_event(event)
-    for g in data_dag.genesis_nodes:
-        outs = list(data_dag.graph.out_edges(g, data=True))
-        if outs:
-            geid = f"genesis_event_{g}"
-            ge = LineageEvent(event_id=geid,
-                              description=f"Genesis for {g}",
-                              inputs=[], outputs=[g],
-                              metadata={"type": "genesis", "artifact": g})
-            event_dag.add_event(ge)
-            for _, _, edata in outs:
-                ev_ref = edata.get('event')
-                if ev_ref and ev_ref in event_dag.events:
-                    event_dag.add_causal_dependency(geid, ev_ref)
-    ev_items = list(event_dag.events.items())
-    for e1_id, e1 in ev_items:
-        for e2_id, e2 in ev_items:
-            if e1_id != e2_id:
-                if set(e1.outputs) & set(e2.inputs):
-                    event_dag.add_causal_dependency(e1_id, e2_id)
+        eid = edata["event"]
+        event_dag.add_event(LineageEvent(event_id=eid, description=f"Transform {src} to {tgt}",
+                                         inputs=[src], outputs=[tgt],
+                                         metadata={"type": "transform", "source": src, "target": tgt}))
+        producers[tgt].append(eid)
+        consumers[src].append(eid)
+    for artifact, prod in producers.items():
+        for e1 in prod:
+            for e2 in consumers.get(artifact, ()):
+                event_dag.add_causal_dependency(e1, e2)
     return event_dag
 
 
-def compute_hashed_level_dag(dag, is_data: bool):
-    """Compute level hashes and concatenated hashes."""
-    crypto = CryptoKeys()
-    level_hashes: Dict[int, bytes] = {}
-    signed_hashes: Dict[int, bytes] = {}
-    concatenated: Dict[int, bytes] = {}
-    levels = dag.levels
-    for level in sorted(levels):
-        nodes = levels[level]
-        full_hash = None
-        for node_id in sorted(nodes):
-            if is_data:
-                h = dag.artifacts[node_id].compute_full_hash()
-            else:
-                h = dag.events[node_id].compute_full_hash()
-            if full_hash is None:
-                full_hash = h
-            else:
-                full_hash = HomomorphicHash.combine(full_hash, h)
-        if full_hash is None:
-            full_hash = b''
-        level_hashes[level] = full_hash
-        sig = crypto.sign(full_hash)
-        signed_hashes[level] = sig
-        if level == 1:
-            concatenated[level] = full_hash
+def link_producing_events(data_dag: DataDAG, event_dag: EventDAG):
+    """Annotates each artifact x with event_ref, the event that produced x
+    from its highest-level parent (the genesis event for genesis artifacts).
+    This is the edge that determines L(x), so level_D(x) = level_E(event_ref)."""
+    for aid, art in data_dag.artifacts.items():
+        parents = list(data_dag.graph.predecessors(aid))
+        if parents:
+            top = max(parents, key=lambda u: (data_dag.level_map[u], u))
+            art.metadata["event_ref"] = data_dag.graph.edges[top, aid]["event"]
         else:
-            prev = concatenated[level-1]
-            concatenated[level] = hashlib.sha256(prev + full_hash).digest()
-    return crypto, level_hashes, signed_hashes, concatenated
+            art.metadata["event_ref"] = f"genesis_event_{aid}"
 
 
-def build_skip_dag(max_level: int, concatenated_hashes: Dict[int, bytes], crypto: CryptoKeys, skip_prob: float):
-    """Build skip DAG (levels as nodes) with edges i->i+2^k pattern."""
-    G = nx.DiGraph()
-    for level in range(1, max_level+1):
-        G.add_node(level)
-    for i in range(1, max_level):
-        G.add_edge(i, i+1)
-    for i in range(1, max_level):
-        skip_dist = 2
-        while i + skip_dist <= max_level:
-            if random.random() <= skip_prob:
-                G.add_edge(i, i + skip_dist)
-                skip_dist *= 2
-            else:
-                break
-    signed_paths: Dict[Tuple[int,int], bytes] = {}
-    for (u, v) in G.edges():
-        src_concat = concatenated_hashes[u]
-        tgt_concat = concatenated_hashes[v]
-        path_data = src_concat + tgt_concat
-        path_hash = hashlib.sha256(path_data).digest()
-        signature = crypto.sign(path_hash)
-        signed_paths[(u, v)] = signature
-    return G, signed_paths
+# ---------------------------------------------------------------------------
+# Signatures
+# ---------------------------------------------------------------------------
 
+class CryptoKeys:
+    """Signing key pair of a DataHub (Ed25519)."""
+    def __init__(self):
+        self.private_key = Ed25519PrivateKey.generate()
+        self.public_key = self.private_key.public_key()
 
-def find_path_in_skip(G: nx.DiGraph, start: int, target: int) -> List[int]:
-    """Find a path from start level to target level in skip DAG."""
-    if start == target:
-        return [start]
-    from collections import deque
-    queue = deque([[start]])
-    visited = {start}
-    while queue:
-        path = queue.popleft()
-        node = path[-1]
-        if node == target:
-            return path
-        for nxt in G.successors(node):
-            if nxt not in visited:
-                visited.add(nxt)
-                queue.append(path + [nxt])
-    return []
+    def sign(self, data: bytes) -> bytes:
+        return self.private_key.sign(data)
 
-
-def verify_skip_path(path: List[int], concatenated_hashes: Dict[int, bytes], crypto: CryptoKeys, signed_paths: Dict[Tuple[int,int], bytes]) -> bool:
-    """Verify signatures along the skip path."""
-    for i in range(len(path)-1):
-        u = path[i]
-        v = path[i+1]
-        if (u, v) not in signed_paths:
+    def verify(self, data: bytes, signature: bytes) -> bool:
+        try:
+            self.public_key.verify(signature, data)
+            return True
+        except InvalidSignature:
             return False
-        data = hashlib.sha256(concatenated_hashes[u] + concatenated_hashes[v]).digest()
-        sig = signed_paths[(u, v)]
-        if not crypto.verify(data, sig):
-            return False
-    return True
 
 
-def assign_buckets(items: List[Any], k_buckets: int) -> Dict[int, List[Any]]:
-    """Assign items to buckets based on hash modulo k_buckets."""
-    buckets = {i: [] for i in range(k_buckets)}
-    for item in items:
-        h = item.compute_full_hash()
-        idx = int.from_bytes(h, 'big') % k_buckets
-        buckets[idx].append(item)
-    return buckets
+# ---------------------------------------------------------------------------
+# Hashed level DAG (Section 3)
+# ---------------------------------------------------------------------------
+
+class HashedLevelDAG:
+    """ECMH level hashes H(L_i), signed level hashes Sig(L_i), and
+    concatenated hashes CH(L_i) = Hash(H(L_1) || ... || H(L_i))."""
+
+    def __init__(self, keys: CryptoKeys):
+        self.keys = keys
+        self.acc: Dict[int, ECMH] = {}
+        self.level_sigs: Dict[int, bytes] = {}
+        self._prefix: List = []   # _prefix[i-1] = SHA-256 state after H(L_1..L_i)
+        self.n = 0
+
+    @classmethod
+    def build(cls, dag, keys: CryptoKeys) -> "HashedLevelDAG":
+        """Single pass over all nodes, O(|V|) point additions."""
+        h = cls(keys)
+        h.n = max(dag.levels) if dag.levels else 0
+        for lvl in range(1, h.n + 1):
+            acc = ECMH()
+            for nid in dag.levels.get(lvl, ()):
+                acc.add(dag.elements[nid].compute_full_hash())
+            h.acc[lvl] = acc
+            h.level_sigs[lvl] = keys.sign(acc.digest())
+        return h
+
+    def level_hash(self, i: int) -> bytes:
+        return self.acc[i].digest()
+
+    def add_to_level(self, j: int, node_hash: bytes):
+        """O(1) incremental update H'(L_j) = H(L_j) (+) phi(H(x))."""
+        if j > self.n:
+            for lvl in range(self.n + 1, j + 1):
+                self.acc[lvl] = ECMH()
+            self.n = j
+        self.acc[j].add(node_hash)
+        self.level_sigs[j] = self.keys.sign(self.acc[j].digest())
+        del self._prefix[j - 1:]
+
+    def ch(self, i: int) -> bytes:
+        while len(self._prefix) < i:
+            k = len(self._prefix) + 1
+            state = self._prefix[-1].copy() if self._prefix else hashlib.sha256()
+            state.update(self.level_hash(k))
+            self._prefix.append(state)
+        return self._prefix[i - 1].copy().digest()
 
 
-def hash_bucket(bucket: List[Any]) -> bytes:
-    """Compute combined hash of all items in a bucket (order is canonical by item.id)."""
-    hashes = [item.compute_full_hash() for item in sorted(bucket, key=lambda x: x.id)]
-    if not hashes:
-        return b'\x00' * 32
-    combined = hashes[0]
-    for h in hashes[1:]:
-        combined = hashlib.sha256(combined + h).digest()
-    return combined
+# ---------------------------------------------------------------------------
+# Deterministic binary skip DAG (Section 4)
+# ---------------------------------------------------------------------------
+
+class SkipDAG:
+    """Levels 1..n with edges (L_i, L_{i+2^k}) for every k >= 0 with i + 2^k <= n."""
+
+    def __init__(self, n: int = 0):
+        self.n = 0
+        self.out: Dict[int, List[int]] = {}
+        self.extend(n)
+
+    def extend(self, n: int):
+        """Adds levels up to n together with their incoming skip edges."""
+        for j in range(self.n + 1, n + 1):
+            self.out[j] = []
+            k = 1
+            while j - k >= 1:
+                self.out[j - k].append(j)
+                k <<= 1
+        self.n = max(self.n, n)
+
+    def edges(self):
+        return [(i, l) for i, targets in self.out.items() for l in targets]
+
+    def number_of_edges(self) -> int:
+        return sum(len(t) for t in self.out.values())
+
+    def to_networkx(self) -> nx.DiGraph:
+        g = nx.DiGraph()
+        g.add_nodes_from(range(1, self.n + 1))
+        g.add_edges_from(self.edges())
+        return g
 
 
-def build_merkle_tree(hashes: List[bytes]) -> Tuple[List[List[bytes]], bytes]:
-    """Build Merkle tree. Returns (all_levels, root). all_levels[0] is leaves."""
-    if not hashes:
-        return [[b'\x00' * 32]], b'\x00' * 32
-    levels = [hashes]
-    while len(levels[-1]) > 1:
-        cur = levels[-1]
-        nxt = []
-        for i in range(0, len(cur), 2):
-            left = cur[i]
-            right = cur[i+1] if i+1 < len(cur) else left
-            nxt.append(hashlib.sha256(left + right).digest())
-        levels.append(nxt)
-    return levels, levels[-1][0]
-
-
-def get_merkle_path(idx: int, levels: List[List[bytes]]) -> List[Tuple[str, bytes]]:
-    """Get Merkle path (proof) for leaf at idx. Returns list of (direction, hash)."""
-    path = []
-    for level in levels[:-1]:
-        if idx % 2 == 0:
-            sibling = idx + 1
-            if sibling < len(level):
-                path.append(("right", level[sibling]))
-        else:
-            sibling = idx - 1
-            path.append(("left", level[sibling]))
-        idx //= 2
+def binary_descent_path(j: int, n: int = None) -> List[int]:
+    """Algorithm 1: BinaryDescentPath(j, n)."""
+    i, path = 1, [1]
+    while i < j:
+        i += 1 << ((j - i).bit_length() - 1)
+        path.append(i)
     return path
 
 
-def verify_merkle_path(leaf_hash: bytes, path: List[Tuple[str, bytes]], root: bytes) -> bool:
-    """Verify a Merkle path from leaf to root."""
-    h = leaf_hash
-    for direction, sibling_hash in path:
-        if direction == "right":
-            h = hashlib.sha256(h + sibling_hash).digest()
-        else:
-            h = hashlib.sha256(sibling_hash + h).digest()
-    return h == root
+def reconstruct_path(skip: SkipDAG, j: int) -> List[int]:
+    """Algorithm 3, Phase 1: forward traversal from L_1, taking at each level
+    the longest skip edge (L_i, L_l) with l <= j."""
+    i, path = 1, [1]
+    while i < j:
+        best = i + 1
+        for l in skip.out.get(i, ()):
+            if best < l <= j:
+                best = l
+        i = best
+        path.append(i)
+    return path
 
 
-def prepare_merkle_metadata(level_items: List[Any], k_buckets: int, crypto: CryptoKeys, is_data: bool):
-    """Assign items to buckets, build Merkle tree, and store proof metadata on each item."""
-    buckets = assign_buckets(level_items, k_buckets)
-    bucket_hashes = []
-    bucket_idx_map = {}
-    for i in range(k_buckets):
-        bh = hash_bucket(buckets[i])
-        bucket_hashes.append(bh)
-        for item in buckets[i]:
-            bucket_idx_map[item.id] = i
-
-    merkle_levels, merkle_root = build_merkle_tree(bucket_hashes)
-    merkle_sig = crypto.sign(merkle_root)
-
-    for item in level_items:
-        idx = bucket_idx_map[item.id]
-        path = get_merkle_path(idx, merkle_levels)
-        item.metadata['merkle_root'] = merkle_root.hex()
-        item.metadata['signed_merkle_root'] = merkle_sig.hex()
-        item.metadata['merkle_path'] = [(d, h.hex()) for d, h in path]
-        item.metadata['bucket_index'] = idx
-        item.metadata['is_data'] = is_data
-
-    return merkle_root, merkle_sig
+def path_hash(path: List[int], hashed: HashedLevelDAG) -> bytes:
+    """PH(pi) = Hash(CH(L_i1) || ... || CH(L_ir))."""
+    return Hash(b"".join(hashed.ch(i) for i in path))
 
 
-def verify_full_membership(item, k_buckets, crypto, level_items):
-    """Verify bucket/Merkle membership for a given item."""
-    bucket_idx = item.metadata['bucket_index']
-    merkle_root = bytes.fromhex(item.metadata['merkle_root'])
-    signed_merkle_root = bytes.fromhex(item.metadata['signed_merkle_root'])
-    merkle_path = [(d, bytes.fromhex(h)) for d, h in item.metadata['merkle_path']]
+def sign_element_path(x, j: int, hashed: HashedLevelDAG, keys: CryptoKeys):
+    """Algorithm 2, steps 2-3: SP(x) = Sign(PH(pi(1, j)), SK), stored in x's metadata."""
+    sp = keys.sign(path_hash(binary_descent_path(j), hashed))
+    x.proof["level"] = j
+    x.proof["signed_path"] = sp
+    return sp
 
-    buckets = assign_buckets(level_items, k_buckets)
-    bucket_hash = hash_bucket(buckets[bucket_idx])
-    valid_merkle_path = verify_merkle_path(bucket_hash, merkle_path, merkle_root)
-    sig_ok = crypto.verify(merkle_root, signed_merkle_root)
-    return valid_merkle_path and sig_ok
+
+# ---------------------------------------------------------------------------
+# Bucket indexing and Merkle trees (Section 5)
+# ---------------------------------------------------------------------------
+
+def bucket_index(digest: bytes, k: int) -> int:
+    """bucket_index(x) = H(x) mod k."""
+    return int.from_bytes(digest, "big") % k
+
+
+def bucket_leaf(bucket: List[bytes]) -> bytes:
+    """H(B_j) = Hash(H(x_1) || ... || H(x_n)), digests in canonical (sorted) order."""
+    return Hash(b"".join(sorted(bucket)))
+
+
+class LevelMerkle:
+    """Buckets of element digests (private storage) and the Merkle tree over
+    them; the signed root SMR_i is the public commitment for level L_i."""
+
+    def __init__(self, k: int, keys: CryptoKeys):
+        self.k = k
+        self.keys = keys
+        self.buckets: List[List[bytes]] = [[] for _ in range(k)]
+        self.tree: List[List[bytes]] = []
+        self.root = b""
+        self.smr = b""
+
+    @classmethod
+    def build(cls, digests: List[bytes], k: int, keys: CryptoKeys) -> "LevelMerkle":
+        """O(m + k): assign m digests to buckets, then build the tree bottom-up."""
+        m = cls(k, keys)
+        for d in digests:
+            m.buckets[bucket_index(d, k)].append(d)
+        level = [bucket_leaf(b) for b in m.buckets]
+        m.tree = [level]
+        while len(level) > 1:
+            level = [Hash(level[i] + (level[i + 1] if i + 1 < len(level) else level[i]))
+                     for i in range(0, len(level), 2)]
+            m.tree.append(level)
+        m.root = level[0]
+        m.smr = keys.sign(m.root)
+        return m
+
+    def insert(self, digest: bytes):
+        """Section 5.2: append to bucket, update the leaf and its path to the root, re-sign."""
+        j = bucket_index(digest, self.k)
+        self.buckets[j].append(digest)
+        self.tree[0][j] = bucket_leaf(self.buckets[j])
+        idx = j
+        for depth in range(1, len(self.tree)):
+            below = self.tree[depth - 1]
+            left = idx - (idx % 2)
+            right = left + 1 if left + 1 < len(below) else left
+            idx //= 2
+            self.tree[depth][idx] = Hash(below[left] + below[right])
+        self.root = self.tree[-1][0]
+        self.smr = self.keys.sign(self.root)
+
+    def proof(self, j: int) -> List[Tuple[str, bytes]]:
+        """MP(x): sibling hashes from leaf B_j up to the root."""
+        path, idx = [], j
+        for level in self.tree[:-1]:
+            sib = idx ^ 1
+            if sib >= len(level):
+                sib = idx
+            path.append(("right" if idx % 2 == 0 else "left", level[sib]))
+            idx //= 2
+        return path
+
+
+def root_from_proof(leaf: bytes, proof: List[Tuple[str, bytes]]) -> bytes:
+    h = leaf
+    for side, sib in proof:
+        h = Hash(h + sib) if side == "right" else Hash(sib + h)
+    return h
+
+
+def verify_merkle_membership(x, merkle: LevelMerkle, public_key: CryptoKeys) -> bool:
+    """Section 5.3: compute j = H(x) mod k, check H(x) in B_j, rebuild the root
+    from MP(x) and verify it against the signed Merkle root SMR_i."""
+    hx = x.compute_full_hash()
+    j = bucket_index(hx, merkle.k)
+    bucket = merkle.buckets[j]
+    if hx not in bucket:
+        return False
+    mr = root_from_proof(bucket_leaf(bucket), merkle.proof(j))
+    return public_key.verify(mr, merkle.smr)
+
+
+# ---------------------------------------------------------------------------
+# One VERDICT instance per DAG (Data or Event)
+# ---------------------------------------------------------------------------
+
+class Verdict:
+    """Hashed level DAG + skip DAG + per-level Merkle trees for one DAG."""
+
+    def __init__(self, dag, keys: CryptoKeys = None, k_buckets: int = 4):
+        self.dag = dag
+        self.keys = keys or CryptoKeys()
+        self.k = k_buckets
+        self.hashed: Optional[HashedLevelDAG] = None
+        self.skip: Optional[SkipDAG] = None
+        self.merkle: Dict[int, LevelMerkle] = {}
+
+    @property
+    def n(self) -> int:
+        return self.hashed.n if self.hashed else 0
+
+    def build_skip_dag(self):
+        """Hashed level DAG (ECMH + signed level hashes) and skip edges."""
+        self.hashed = HashedLevelDAG.build(self.dag, self.keys)
+        self.skip = SkipDAG(self.hashed.n)
+
+    def build_merkle(self):
+        """Bucket assignment, Merkle trees and signed roots for every level."""
+        self.merkle = {
+            lvl: LevelMerkle.build([self.dag.elements[nid].compute_full_hash() for nid in nodes],
+                                   self.k, self.keys)
+            for lvl, nodes in self.dag.levels.items()
+        }
+
+    def sign_all_paths(self):
+        """Signed path proof for every element already in the DAG."""
+        for nid, lvl in self.dag.level_map.items():
+            sign_element_path(self.dag.elements[nid], lvl, self.hashed, self.keys)
+
+    def build(self):
+        self.build_skip_dag()
+        self.build_merkle()
+        self.sign_all_paths()
+        return self
+
+    # -- Algorithm 2 ----------------------------------------------------------
+    def insert(self, x, j: int):
+        """InsertIntoSkipDAG(x, j, GS, SK)."""
+        if j > self.skip.n:
+            self.skip.extend(j)
+        hx = x.compute_full_hash()
+        self.hashed.add_to_level(j, hx)
+        return sign_element_path(x, j, self.hashed, self.keys)
+
+    def insert_merkle(self, x, j: int):
+        if j not in self.merkle:
+            self.merkle[j] = LevelMerkle.build([], self.k, self.keys)
+        self.merkle[j].insert(x.compute_full_hash())
+
+    # -- Algorithm 3 ----------------------------------------------------------
+    def verify_path(self, x) -> bool:
+        """Phases 1-2: reconstruct the path to L_j and verify the signed path hash."""
+        j = x.proof.get("level")
+        if j is None or not 1 <= j <= self.skip.n:
+            return False
+        path = reconstruct_path(self.skip, j)
+        if path[-1] != j:
+            return False
+        return self.keys.verify(path_hash(path, self.hashed), x.proof["signed_path"])
+
+    def verify_membership(self, x) -> bool:
+        """Phase 3: Merkle membership of x in L_j."""
+        merkle = self.merkle.get(x.proof.get("level"))
+        return merkle is not None and verify_merkle_membership(x, merkle, self.keys)
+
+    def verify_existence(self, x) -> bool:
+        """VerifyExistence(x, GS, PK)."""
+        return self.verify_path(x) and self.verify_membership(x)
+
+
+def verify_cross_dag(x: DataArtifact, data: Verdict, event: Verdict) -> bool:
+    """Section 5.4: joint verification of x in the Data DAG and of its producing
+    event e_x in the Event DAG, at the same level."""
+    if not data.verify_existence(x):
+        return False
+    e = event.dag.events.get(x.metadata.get("event_ref"))
+    if e is None or not event.verify_existence(e):
+        return False
+    if x.proof["level"] != e.proof["level"]:
+        return False
+    return event.verify_membership(e)
+
+
+def build_system(nodes: int, genesis: int, edges: int, k_buckets: int = 4):
+    """Generates a synthetic lineage workload and builds VERDICT on both DAGs."""
+    data_dag = generate_data_dag(nodes, genesis, edges)
+    event_dag = extract_event_dag(data_dag)
+    data_dag.partition_into_levels()
+    event_dag.partition_into_levels()
+    link_producing_events(data_dag, event_dag)
+    return Verdict(data_dag, k_buckets=k_buckets).build(), Verdict(event_dag, k_buckets=k_buckets).build()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Secure Lineage DAG (with bucket indexing/Merkle tree verification)")
+    parser = argparse.ArgumentParser(description="VERDICT demo: build both DAGs and verify one artifact end to end")
     parser.add_argument("--nodes", type=int, default=10, help="Number of data artifacts")
     parser.add_argument("--genesis", type=int, default=2, help="Number of genesis nodes")
     parser.add_argument("--edges", type=int, default=2, help="Max edges per node")
-    parser.add_argument("--skip-prob", type=float, default=1.0, help="Probability to include each skip link")
     parser.add_argument("--buckets", type=int, default=4, help="Buckets per level for Merkle proof")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (default: unseeded)")
     args = parser.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
 
-    data_dag = generate_data_dag(args.nodes, args.genesis, args.edges)
-    event_dag = extract_event_dag(data_dag)
-    assert nx.is_directed_acyclic_graph(data_dag.graph), "Data DAG has cycles!"
-    assert nx.is_directed_acyclic_graph(event_dag.graph), "Event DAG has cycles!"
+    data, event = build_system(args.nodes, args.genesis, args.edges, args.buckets)
+    assert nx.is_directed_acyclic_graph(data.dag.graph) and nx.is_directed_acyclic_graph(event.dag.graph)
 
-    data_levels, data_level_map = data_dag.partition_into_levels()
-    event_levels, event_level_map = event_dag.partition_into_levels()
+    for name, v in (("Data", data), ("Event", event)):
+        print(f"{name} DAG: {v.dag.graph.number_of_nodes()} nodes, {v.n} levels, "
+              f"{v.skip.number_of_edges()} skip edges")
+        for lvl in range(1, v.n + 1):
+            print(f"  Level {lvl}: |L|={len(v.dag.levels.get(lvl, ()))}  "
+                  f"H(L)={v.hashed.level_hash(lvl).hex()[:16]}...  MR={v.merkle[lvl].root.hex()[:16]}...")
 
-    print("Data DAG levels:")
-    for lvl in sorted(data_levels):
-        print(f"  Level {lvl}: {sorted(data_levels[lvl])}")
-    print("Event DAG levels:")
-    for lvl in sorted(event_levels):
-        print(f"  Level {lvl}: {sorted(event_levels[lvl])}")
-
-    data_crypto, data_level_hashes, data_signed_hashes, data_concat = compute_hashed_level_dag(data_dag, is_data=True)
-    event_crypto, event_level_hashes, event_signed_hashes, event_concat = compute_hashed_level_dag(event_dag, is_data=False)
-
-    print("\nAssigning buckets and preparing Merkle trees for Data DAG levels:")
-    data_merkle_roots = {}
-    for lvl in sorted(data_levels):
-        items = [data_dag.artifacts[nid] for nid in sorted(data_levels[lvl])]
-        root, sig = prepare_merkle_metadata(items, args.buckets, data_crypto, is_data=True)
-        data_merkle_roots[lvl] = (root, sig)
-        print(f"  Data Level {lvl} Merkle root: {root.hex()[:16]}..., signature: {sig.hex()[:16]}...")
-
-    print("\nAssigning buckets and preparing Merkle trees for Event DAG levels:")
-    event_merkle_roots = {}
-    for lvl in sorted(event_levels):
-        items = [event_dag.events[nid] for nid in sorted(event_levels[lvl])]
-        root, sig = prepare_merkle_metadata(items, args.buckets, event_crypto, is_data=False)
-        event_merkle_roots[lvl] = (root, sig)
-        print(f"  Event Level {lvl} Merkle root: {root.hex()[:16]}..., signature: {sig.hex()[:16]}...")
-
-    max_data_level = max(data_levels) if data_levels else 0
-    max_event_level = max(event_levels) if event_levels else 0
-    data_skip_graph, data_skip_sigs = build_skip_dag(max_data_level, data_concat, data_crypto, args.skip_prob)
-    event_skip_graph, event_skip_sigs = build_skip_dag(max_event_level, event_concat, event_crypto, args.skip_prob)
-
-    if data_level_map:
-        artifact_id, level = random.choice(list(data_level_map.items()))
-        art = data_dag.artifacts[artifact_id]
-        print(f"\nVerifying Data artifact {artifact_id} (level {level}):")
-        path = find_path_in_skip(data_skip_graph, 1, level)
-        path_ok = path and verify_skip_path(path, data_concat, data_crypto, data_skip_sigs)
-        print(f"  Skip DAG path: {path}, verified: {path_ok}")
-        level_items = [data_dag.artifacts[nid] for nid in sorted(data_levels[level])]
-        bucket_merkle_ok = verify_full_membership(art, args.buckets, data_crypto, level_items)
-        print(f"  Merkle path verification: {bucket_merkle_ok}")
-        print("  --> FULL VERIFICATION:", "SUCCESS" if path_ok and bucket_merkle_ok else "FAILED")
+    artifact_id, level = random.choice(sorted(data.dag.level_map.items()))
+    art = data.dag.artifacts[artifact_id]
+    print(f"\nVerifying data artifact {artifact_id} (level {level}):")
+    print(f"  Binary-descent path: {binary_descent_path(level)}")
+    path_ok = data.verify_path(art)
+    merkle_ok = data.verify_membership(art)
+    cross_ok = verify_cross_dag(art, data, event)
+    print(f"  Signed path verification: {path_ok}")
+    print(f"  Merkle membership verification: {merkle_ok}")
+    print(f"  Cross-DAG verification (event {art.metadata['event_ref']}): {cross_ok}")
+    print("  --> FULL VERIFICATION:", "SUCCESS" if path_ok and merkle_ok and cross_ok else "FAILED")
 
 
 if __name__ == "__main__":

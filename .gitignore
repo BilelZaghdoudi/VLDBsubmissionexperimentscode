@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# local experiment outputs (the paper's results live in results/ and figures/)
+results_*/
+figures_*/
+lineage_eval/
+/skip_insertion_eval_detailed_results_*.csv
+*.html
+lib/

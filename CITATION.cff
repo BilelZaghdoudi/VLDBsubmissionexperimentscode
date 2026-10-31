@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "VERDICT: experiment code"
+authors:
+  - family-names: Zaghdoudi
+    given-names: Bilel
+    affiliation: "LIP6, CNRS, Sorbonne Université"
+  - family-names: Potop-Butucaru
+    given-names: Maria
+    affiliation: "LIP6, CNRS, Sorbonne Université"
+repository-code: "https://github.com/BilelZaghdoudi/VLDBsubmissionexperimentscode"
+license: MIT
+preferred-citation:
+  type: article
+  title: "A Verifiable Framework for Secure Data Lineage in Decentralized DAGs"
+  authors:
+    - family-names: Zaghdoudi
+      given-names: Bilel
+    - family-names: Potop-Butucaru
+      given-names: Maria
+  journal: "Proceedings of the VLDB Endowment"
+  volume: 20
+  year: 2027
+  notes: "Under submission"
