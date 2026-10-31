@@ -101,7 +101,7 @@ python plot_results.py --results results --figures figures
 | Fig. 7 – Merkle verification time vs. nodes | `fig7_merkle_verification_vs_nodes.png` | `nodes` | Algorithm 3, phase 3 (`*_merkle_verification_time_ms`) |
 | Fig. 8 – Verification time vs. genesis nodes | `fig8_verification_vs_genesis.png` | `genesis` | Algorithm 3, phases 1–2 (`*_verification_time_ms`) |
 | Fig. 9 – Verification time vs. edges per node | `fig9_verification_vs_edges.png` | `edges` | Algorithm 3, phases 1–2 (`*_verification_time_ms`) |
-| Technical report, Fig. 3 – Skip DAG diversity vs. nodes | `fig10_skip_diversity_vs_nodes.png` | `nodes` | Shannon entropy of skip-edge lengths (`*_skip_diversity`) |
+| Additional figure (not in the paper) – Skip DAG diversity vs. nodes | `fig10_skip_diversity_vs_nodes.png` | `nodes` | Shannon entropy of skip-edge lengths (`*_skip_diversity`) |
 
 Table 1 (comparison with LineageChain and ForensiBlock) reports figures taken from those systems' publications and is not produced by this code.
 
